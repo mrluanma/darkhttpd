@@ -858,20 +858,56 @@ static void didl_begin(struct buf *d) {
     bstr(d, "<DIDL-Lite"
              " xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\""
              " xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
-             " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">");
+             " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\""
+             " xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\">");
+}
+
+/* Count the children we would present for a directory: subdirectories plus
+ * files with a known media extension.  Picky TV firmwares use childCount to
+ * decide whether a container is worth showing. */
+static int count_children(const char *fsdir) {
+    DIR *d = opendir(fsdir);
+    struct dirent *de;
+    int n = 0;
+
+    if (d == NULL) return 0;
+    while ((de = readdir(d)) != NULL) {
+        size_t nlen = strlen(de->d_name);
+        char *fs;
+        struct stat st;
+        int is_dir;
+
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (de->d_name[0] == '.') continue;
+        if (nlen > MAXNAMLEN) continue;
+
+        fs = malloc(strlen(fsdir) + nlen + 2);
+        if (fs == NULL) oom();
+        snprintf(fs, strlen(fsdir) + nlen + 2, "%s/%s", fsdir, de->d_name);
+        if (stat(fs, &st) == -1) { free(fs); continue; }
+        is_dir = S_ISDIR(st.st_mode);
+        free(fs);
+
+        if (is_dir || mime_for(de->d_name) != NULL) n++;
+    }
+    closedir(d);
+    return n;
 }
 
 static void emit_container(struct buf *d, const char *id, const char *parent,
-        const char *title) {
+        const char *title, int child_count) {
     bstr(d, "<container id=\"");
     besc(d, id);
     bstr(d, "\" parentID=\"");
     besc(d, parent);
-    bstr(d, "\" restricted=\"1\" searchable=\"0\">");
+    bprintf(d, "\" childCount=\"%d\" restricted=\"1\" searchable=\"0\">",
+        child_count);
     bstr(d, "<dc:title>");
     besc(d, title);
     bstr(d, "</dc:title>");
     bstr(d, "<upnp:class>object.container.storageFolder</upnp:class>");
+    bstr(d, "<upnp:storageUsed>-1</upnp:storageUsed>");
     bstr(d, "</container>");
 }
 
@@ -1009,7 +1045,7 @@ static void browse_children(const char *container_id, const char *fsdir,
             snprintf(parent, sizeof(parent), "%s", container_id);
 
         if (ents[i].is_dir) {
-            emit_container(didl, id, parent, ents[i].name);
+            emit_container(didl, id, parent, ents[i].name, count_children(fs));
         } else {
             const char *mime = mime_for(ents[i].name);
             emit_item(didl, id, parent, ents[i].name, mime, st.st_size);
@@ -1033,7 +1069,7 @@ static void browse_object(const char *object_id, struct buf *didl,
     *total = 0;
 
     if (strcmp(object_id, "0") == 0) {
-        emit_container(didl, "0", "-1", friendly);
+        emit_container(didl, "0", "-1", friendly, count_children(root));
         *nret = 1;
         *total = 1;
         return;
@@ -1046,7 +1082,7 @@ static void browse_object(const char *object_id, struct buf *didl,
             parent_of(object_id, parent, sizeof(parent));
             if (S_ISDIR(st.st_mode)) {
                 emit_container(didl, object_id, parent,
-                    path_basename(object_id));
+                    path_basename(object_id), count_children(fs));
             } else {
                 const char *mime = mime_for(object_id);
                 if (mime != NULL)
