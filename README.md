@@ -21,6 +21,8 @@ Features:
 * Supports IPv6.
 * Support arbitrary custom response headers.
 * Can serve 301 redirects based on Host header.
+* Optional DLNA/UPnP MediaServer mode with `--dlna`, so smart TVs and media
+  players can discover, browse and stream the served media.
 * Uses sendfile() on FreeBSD, Solaris and Linux.
 * Can use acceptfilter on FreeBSD.
 * Can use chroot as non-root on FreeBSD 14+.
@@ -153,6 +155,35 @@ requests):
 ```
 ./darkhttpd /var/www/htdocs --header 'Access-Control-Allow-Origin: *'
 ```
+
+## Serving video to a TV with DLNA/UPnP
+
+Pass `--dlna` to make the served directory discoverable as a DLNA MediaServer.
+Most smart TVs and networked media players will then find it automatically and
+let you browse and play the media files it contains:
+
+```
+./darkhttpd /var/www/videos --port 8080 --dlna
+```
+
+The name shown on the TV defaults to the hostname; you can override it, and
+also choose which of the host's addresses to advertise (useful on multi-homed
+machines):
+
+```
+./darkhttpd /var/www/videos --port 8080 --dlna \
+  --dlna-name "Living Room" --dlna-ip 192.168.0.10
+```
+
+Notes:
+
+* Only files with a known video, audio or image extension are listed;
+  subdirectories are browsable. `--mimetypes` does not affect this list.
+* Metadata is derived from filenames - embedded tags and transcoding are not
+  supported.
+* Discovery uses SSDP (UDP port 1900, multicast group 239.255.255.250), so
+  allow that through your firewall. The TV must be on the same network
+  segment, and `--dlna-ip` must name an address the TV can reach.
 
 Commandline options can be combined:
 

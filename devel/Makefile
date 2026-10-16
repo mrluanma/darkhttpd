@@ -8,33 +8,40 @@ SRCS := $(wildcard test_*.c)
 OBJS := $(SRCS:.c=.o)
 TESTS := $(SRCS:.c=)
 
+# The upnp.c translation unit is built once, without coverage
+# instrumentation (the coverage report only covers darkhttpd.c).
+UPNP_OBJ := upnp.o
+
 all: $(TESTS) darkhttpd darkhttpd_no_debug darkhttpd_no_ipv6
 	./run-tests
 
 format:
 	clang-format -i test_parse_field.c
 
-$(OBJS): %.o: %.c ../darkhttpd.c
+$(OBJS): %.o: %.c ../darkhttpd.c ../upnp.h
 	$(CCACHE) $(CC) $(CCFLAGS) -DDEBUG -c $<
 
+$(UPNP_OBJ): ../upnp.c ../upnp.h
+	$(CCACHE) $(CC) $(CCFLAGS) -c ../upnp.c -o $@
+
 # Linking is uncacheable.
-$(TESTS): %: %.o
-	$(CC) $(CCFLAGS) -o $@ $<
+$(TESTS): %: %.o $(UPNP_OBJ)
+	$(CC) $(CCFLAGS) -o $@ $< $(UPNP_OBJ)
 
 # Debug build with coverage instrumentation.
-darkhttpd: ../darkhttpd.c
-	$(CCACHE) $(CC) $(COVFLAGS) -c $< -o darkhttpd.o
-	$(CC) $(COVFLAGS) darkhttpd.o -o darkhttpd
+darkhttpd: ../darkhttpd.c $(UPNP_OBJ) ../upnp.h
+	$(CCACHE) $(CC) $(COVFLAGS) -c ../darkhttpd.c -o darkhttpd.o
+	$(CC) $(COVFLAGS) darkhttpd.o $(UPNP_OBJ) -o darkhttpd
 
 # Test building without -DDEBUG
-darkhttpd_no_debug: ../darkhttpd.c
-	$(CCACHE) $(CC) $(CCFLAGS) -c $< -o darkhttpd_no_debug.o
-	$(CC) $(CCFLAGS) -o $@ darkhttpd_no_debug.o
+darkhttpd_no_debug: ../darkhttpd.c $(UPNP_OBJ) ../upnp.h
+	$(CCACHE) $(CC) $(CCFLAGS) -c ../darkhttpd.c -o darkhttpd_no_debug.o
+	$(CC) $(CCFLAGS) -o $@ darkhttpd_no_debug.o $(UPNP_OBJ)
 
 # Test building with -DNO_IPV6
-darkhttpd_no_ipv6: ../darkhttpd.c
-	$(CCACHE) $(CC) $(CCFLAGS) -DNO_IPV6 -c $< -o darkhttpd_no_ipv6.o
-	$(CC) $(CCFLAGS) -o $@ darkhttpd_no_ipv6.o
+darkhttpd_no_ipv6: ../darkhttpd.c $(UPNP_OBJ) ../upnp.h
+	$(CCACHE) $(CC) $(CCFLAGS) -DNO_IPV6 -c ../darkhttpd.c -o darkhttpd_no_ipv6.o
+	$(CC) $(CCFLAGS) -o $@ darkhttpd_no_ipv6.o $(UPNP_OBJ)
 
 clean:
 	rm -f 	*.gcov \
@@ -48,7 +55,8 @@ clean:
 		darkhttpd_no_debug darkhttpd_no_debug.o \
 		darkhttpd_no_ipv6 darkhttpd_no_ipv6.o \
 		darkhttpd.gcda darkhttpd.gcno \
-		fuzz_darkhttpd.o \
+		upnp.o upnp.gcda upnp.gcno \
+		fuzz_darkhttpd.o fuzz_upnp.o \
 		fuzz_make_safe_uri \
 		fuzz_socket \
 		fuzz_parse_request

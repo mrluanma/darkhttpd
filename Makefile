@@ -4,8 +4,8 @@ LIBS=`[ \`uname\` = "SunOS" ] && echo -lsocket -lnsl -lsendfile`
 
 all: darkhttpd
 
-darkhttpd: darkhttpd.c
-	$(CC) $(CFLAGS) $(LDFLAGS) $(LIBS) darkhttpd.c -o $@
+darkhttpd: darkhttpd.c upnp.c upnp.h
+	$(CC) $(CFLAGS) $(LDFLAGS) $(LIBS) darkhttpd.c upnp.c -o $@
 
 test:
 	$(MAKE) -C devel

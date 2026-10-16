@@ -71,6 +71,8 @@ static const int debug = 1;
 #include <time.h>
 #include <unistd.h>
 
+#include "upnp.h"
+
 /* The time formatting that we use in directory listings.                    */
 /* An example of the default is 2013-09-09 13:01, which should be compatible */
 /* with xbmc/kodi.                                                           */
@@ -335,6 +337,9 @@ static char *server_hdr = NULL;
 static char *auth_key = NULL;       /* NULL or "Basic base64_of_password" */
 static char *custom_hdrs = NULL;
 static char *trusted_ip = NULL;     /* Address of a trusted reverse proxy */
+static int want_dlna = 0;           /* --dlna: enable DLNA/UPnP MediaServer */
+static const char *dlna_name = NULL;    /* --dlna-name: friendly name */
+static const char *dlna_ip = NULL;      /* --dlna-ip: advertised IPv4 addr */
 static uint64_t num_requests = 0, total_in = 0, total_out = 0;
 static int accepting = 1;           /* set to 0 to stop accept()ing */
 static int syslog_enabled = 0;
@@ -1020,6 +1025,14 @@ static void usage(const char *argv0) {
     "\t\tAdd a custom header to all responses.\n"
     "\t\tThis option can be specified multiple times, in which case\n"
     "\t\tthe headers are added in order of appearance.\n\n");
+    printf("\t--dlna (default: off)\n"
+    "\t\tEnable DLNA/UPnP so smart TVs and media players can discover\n"
+    "\t\tand browse wwwroot as a MediaServer and stream media files.\n\n");
+    printf("\t--dlna-name friendly_name (default: hostname)\n"
+    "\t\tName shown on DLNA clients.\n\n");
+    printf("\t--dlna-ip ip (default: auto-detect)\n"
+    "\t\tIPv4 address advertised to DLNA clients. Useful on hosts\n"
+    "\t\twith multiple interfaces.\n\n");
 #ifndef HAVE_INET6
     printf("\t(This binary was built without IPv6 support: -DNO_IPV6)\n\n");
 #endif
@@ -1271,6 +1284,19 @@ static void parse_commandline(const int argc, char *argv[]) {
             char *old_custom_hdrs = custom_hdrs;
             xasprintf(&custom_hdrs, "%s%s\r\n", old_custom_hdrs, argv[i]);
             free(old_custom_hdrs);
+        }
+        else if (strcmp(argv[i], "--dlna") == 0) {
+            want_dlna = 1;
+        }
+        else if (strcmp(argv[i], "--dlna-name") == 0) {
+            if (++i >= argc)
+                errx(1, "missing name after --dlna-name");
+            dlna_name = argv[i];
+        }
+        else if (strcmp(argv[i], "--dlna-ip") == 0) {
+            if (++i >= argc)
+                errx(1, "missing ip after --dlna-ip");
+            dlna_ip = argv[i];
         }
 #ifdef HAVE_INET6
         else if (strcmp(argv[i], "--ipv6") == 0) {
@@ -2281,6 +2307,7 @@ static void process_get(struct connection *conn) {
     char date[DATE_LEN], lastmod[DATE_LEN];
     const char *mimetype = NULL;
     const char *forward_to = NULL;
+    const char *dlna_hdr = "";
     struct stat filestat;
 
     /* strip out query params */
@@ -2411,6 +2438,9 @@ static void process_get(struct connection *conn) {
         return;
     }
 
+    if (want_dlna)
+        dlna_hdr = upnp_media_headers(mimetype);
+
     conn->reply_type = REPLY_FROMFILE;
     rfc1123_date(lastmod, filestat.st_mtime);
 
@@ -2491,6 +2521,7 @@ static void process_get(struct connection *conn) {
             "Accept-Ranges: bytes\r\n"
             "%s" /* keep-alive */
             "%s" /* custom headers */
+            "%s" /* dlna headers */
             "Content-Length: %llu\r\n"
             "Content-Range: bytes %llu-%llu/%llu\r\n"
             "Content-Type: %s\r\n"
@@ -2498,7 +2529,7 @@ static void process_get(struct connection *conn) {
             "\r\n"
             ,
             rfc1123_date(date, now), server_hdr, keep_alive(conn),
-            custom_hdrs,
+            custom_hdrs, dlna_hdr,
             llu(conn->reply_length), llu(from), llu(to),
             llu(filestat.st_size), mimetype, lastmod
         );
@@ -2517,13 +2548,14 @@ static void process_get(struct connection *conn) {
             "Accept-Ranges: bytes\r\n"
             "%s" /* keep-alive */
             "%s" /* custom headers */
+            "%s" /* dlna headers */
             "Content-Length: %llu\r\n"
             "Content-Type: %s\r\n"
             "Last-Modified: %s\r\n"
             "\r\n"
             ,
             rfc1123_date(date, now), server_hdr, keep_alive(conn),
-            custom_hdrs, llu(conn->reply_length), mimetype, lastmod
+            custom_hdrs, dlna_hdr, llu(conn->reply_length), mimetype, lastmod
         );
         conn->http_code = 200;
     }
@@ -2556,6 +2588,36 @@ static int password_equal(const char *user_input, const char *secret) {
     return out == 0;
 }
 
+/* Hand a request to the DLNA/UPnP subsystem. Returns 1 if it was handled;
+ * the subsystem produces a complete HTTP response which we send verbatim as
+ * the response "header" (with header_only set, so no separate body is sent).
+ */
+static int dlna_request(struct connection *conn) {
+    char *response = NULL;
+    size_t response_length = 0;
+    int code;
+
+    if (!want_dlna)
+        return 0;
+
+    code = upnp_http_request(conn->method, conn->url,
+        conn->request, conn->request_length, &response, &response_length);
+    if (code == 0)
+        return 0;
+
+    conn->header = response;
+    conn->header_length = response_length;
+    conn->header_dont_free = 0;
+    conn->header_only = 1;
+    conn->reply = NULL;
+    conn->reply_length = 0;
+    conn->reply_type = REPLY_GENERATED;
+    conn->reply_start = 0;
+    conn->http_code = code;
+    conn->conn_close = 1;
+    return 1;
+}
+
 /* Process a request: build the header and reply, advance state. */
 static void process_request(struct connection *conn) {
     num_requests++;
@@ -2575,6 +2637,9 @@ static void process_request(struct connection *conn) {
         default_reply(conn, 401, "Unauthorized",
             "Access denied due to invalid credentials.");
     }
+    else if (dlna_request(conn)) {
+        /* Handled by the DLNA/UPnP subsystem. */
+    }
     else if (strcmp(conn->method, "GET") == 0) {
         process_get(conn);
     }
@@ -2593,6 +2658,55 @@ static void process_request(struct connection *conn) {
     /* request not needed anymore */
     free(conn->request);
     conn->request = NULL; /* important: don't free it again later */
+}
+
+/* Find the first occurrence of a byte sequence within a possibly
+ * NUL-containing buffer. Returns the offset, or -1 if not found.
+ */
+static ssize_t find_bytes(const char *hay, const size_t haylen,
+        const char *needle, const size_t needlelen) {
+    size_t i;
+    if (needlelen == 0 || haylen < needlelen)
+        return -1;
+    for (i = 0; i + needlelen <= haylen; i++)
+        if (memcmp(hay + i, needle, needlelen) == 0)
+            return (ssize_t)i;
+    return -1;
+}
+
+/* Returns 1 once a complete request has been received. Requests without a
+ * body are complete at the end of the headers; POST/PUT also wait for the
+ * number of bytes given by Content-Length (used by DLNA SOAP control).
+ */
+static int request_complete(const struct connection *conn) {
+    ssize_t pos;
+    size_t header_end;
+
+    pos = find_bytes(conn->request, conn->request_length, "\r\n\r\n", 4);
+    if (pos != -1)
+        header_end = (size_t)pos + 4;
+    else {
+        pos = find_bytes(conn->request, conn->request_length, "\n\n", 2);
+        if (pos == -1)
+            return 0;
+        header_end = (size_t)pos + 2;
+    }
+
+    if ((memcmp(conn->request, "POST ", 5) == 0) ||
+        (memcmp(conn->request, "PUT ", 4) == 0)) {
+        long long content_length = 0;
+        char *field = parse_field(conn, "\nContent-Length: ");
+        if (field != NULL) {
+            str_to_num(field, &content_length);
+            free(field);
+        }
+        if (content_length < 0)
+            content_length = 0;
+        if (conn->request_length < header_end + (size_t)content_length)
+            return 0; /* still waiting for the body */
+    }
+
+    return 1;
 }
 
 /* Receiving request. */
@@ -2630,12 +2744,8 @@ static void poll_recv_request(struct connection *conn) {
     total_in += (size_t)recvd;
 
     /* process request if we have all of it */
-    if ((conn->request_length > 2) &&
-        (memcmp(conn->request+conn->request_length-2, "\n\n", 2) == 0))
-            process_request(conn);
-    else if ((conn->request_length > 4) &&
-        (memcmp(conn->request+conn->request_length-4, "\r\n\r\n", 4) == 0))
-            process_request(conn);
+    if (request_complete(conn))
+        process_request(conn);
 
     /* die if it's too large */
     if (conn->request_length > MAX_REQUEST_LENGTH) {
@@ -2830,6 +2940,7 @@ static void httpd_poll(void) {
     int max_fd, select_ret;
     struct connection *conn, *next;
     int bother_with_timeout = 0;
+    int ssdp_fd, upnp_tmo;
     struct timeval timeout, t0, t1;
 
     timeout.tv_sec = timeout_secs;
@@ -2839,11 +2950,14 @@ static void httpd_poll(void) {
     FD_ZERO(&send_set);
     max_fd = 0;
 
+    ssdp_fd = want_dlna ? upnp_ssdp_fd() : -1;
+
     /* set recv/send fd_sets */
 #define MAX_FD_SET(sock, fdset) do { FD_SET(sock,fdset); \
                                 max_fd = (max_fd<sock) ? sock : max_fd; } \
                                 while (0)
     if (accepting) MAX_FD_SET(sockin, &recv_set);
+    if (ssdp_fd != -1) MAX_FD_SET(ssdp_fd, &recv_set);
 
     LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
         switch (conn->state) {
@@ -2873,7 +2987,14 @@ static void httpd_poll(void) {
 #endif
 
     /* -select- */
-    if (timeout_secs == 0) {
+    /* Wake up in time for periodic SSDP announcements even with no
+     * connections, unless an even shorter connection timeout applies. */
+    upnp_tmo = want_dlna ? upnp_next_timeout() : -1;
+    if (upnp_tmo >= 0) {
+        bother_with_timeout = 1;
+        if (timeout_secs == 0 || upnp_tmo < timeout_secs)
+            timeout.tv_sec = upnp_tmo;
+    } else if (timeout_secs == 0) {
         bother_with_timeout = 0;
     }
     if (debug) {
@@ -2908,6 +3029,12 @@ static void httpd_poll(void) {
 
     /* update time */
     now = time(NULL);
+
+    /* service DLNA/UPnP discovery */
+    if (ssdp_fd != -1 && FD_ISSET(ssdp_fd, &recv_set))
+        upnp_handle_ssdp();
+    if (want_dlna)
+        upnp_periodic();
 
     /* poll connections that select() says need attention */
     if (FD_ISSET(sockin, &recv_set))
@@ -3185,11 +3312,32 @@ int main(int argc, char **argv) {
 
     if (want_daemon) daemonize_finish();
 
+    /* start DLNA/UPnP, if requested */
+    if (want_dlna) {
+        unsigned short dlna_port = bindport;
+        if (dlna_port == 0) {
+            /* --port 0: find the port the kernel actually bound. */
+            struct sockaddr_storage ss;
+            socklen_t sl = sizeof(ss);
+            if (getsockname(sockin, (struct sockaddr *)&ss, &sl) == 0) {
+                if (ss.ss_family == AF_INET)
+                    dlna_port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+#ifdef HAVE_INET6
+                else if (ss.ss_family == AF_INET6)
+                    dlna_port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+#endif
+            }
+        }
+        if (upnp_init(dlna_name, wwwroot, dlna_port, bindaddr, dlna_ip) != 0)
+            fprintf(stderr, "warning: failed to start DLNA/UPnP\n");
+    }
+
     /* main loop */
     running = 1;
     while (running) httpd_poll();
 
     /* clean exit */
+    if (want_dlna) upnp_shutdown();
     xclose(sockin);
     if (logfile != NULL) fclose(logfile);
     if (pidfile_name) pidfile_remove();

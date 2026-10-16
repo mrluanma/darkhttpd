@@ -69,6 +69,15 @@ runtests() {
   kill $PID
   wait $PID
 
+  echo "===> run --dlna tests"
+  ./darkhttpd $DIR --port $PORT --addr $ADDR --dlna --dlna-name "darkhttpd test" \
+    --dlna-ip $ADDR >>test.out.stdout 2>>test.out.stderr &
+  PID=$!
+  kill -0 $PID || exit 1
+  $PYTHON test_dlna.py || exit 1
+  kill $PID
+  wait $PID
+
   echo "===> run --log tests"
   rm -f test_logging.log
   ./darkhttpd $DIR --port $PORT --addr $ADDR --log test_logging.log \
