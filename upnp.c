@@ -38,7 +38,15 @@
 #define SSDP_ADDR        "239.255.255.250"
 #define SSDP_PORT        1900
 #define SSDP_MAX_AGE     1800
-#define SSDP_NOTIFY_EVERY (SSDP_MAX_AGE / 2)
+/* Re-announce well inside max-age so a lost packet or two on Wi-Fi does not
+ * let control points expire us. */
+#define SSDP_NOTIFY_EVERY 300
+/* Periodically rebuild the SSDP socket: this is the part a restart repairs
+ * when discovery mysteriously stops (lost multicast membership, stale
+ * interface binding, etc.). */
+#define SSDP_REOPEN_AFTER 900
+/* Retry interval when the initial socket could not be opened. */
+#define SSDP_RETRY        30
 
 #define UPNP_SERVER      "UPnP/1.0 darkhttpd/1.17"
 #define DLNA_PROTO_SUFFIX \
@@ -55,9 +63,11 @@
 
 static int active = 0;              /* non-zero once upnp_init() succeeded   */
 static int ssdp_sock = -1;          /* SSDP multicast UDP socket             */
+static time_t ssdp_born = 0;        /* when ssdp_sock was last (re)opened    */
 static unsigned short http_port = 8080;
 static struct in_addr server_addr;  /* address advertised to clients         */
 static char server_addr_str[64];    /* dotted-quad of server_addr            */
+static int ip_fixed = 0;            /* user pinned the advertised address    */
 static char uuid[64];               /* stable device UUID                    */
 static char friendly[128];          /* friendly name                         */
 static char *root = NULL;           /* wwwroot, trailing slash stripped      */
@@ -605,9 +615,35 @@ void upnp_handle_ssdp(void) {
     }
 }
 
+/* Defined with the socket helpers below. */
+static void ssdp_join(int fd);
+static int ssdp_open(void);
+static void ssdp_reopen(void);
+
+/* Re-detect the address we advertise, unless the user pinned it with
+ * --dlna-ip/--addr.  Without this, a DHCP lease change leaves every LOCATION
+ * and media URL pointing at the old address until the server is restarted. */
+static void refresh_addr(void) {
+    struct in_addr a;
+    char buf[64];
+
+    if (ip_fixed) return;
+
+    detect_addr(NULL, NULL, &a);
+    if (a.s_addr == htonl(INADDR_LOOPBACK)) return; /* offline; keep old */
+    if (a.s_addr == server_addr.s_addr) return;
+
+    server_addr = a;
+    if (inet_ntop(AF_INET, &server_addr, buf, sizeof(buf)) != NULL)
+        snprintf(server_addr_str, sizeof(server_addr_str), "%s", buf);
+    next_alive = 0; /* re-announce the new location immediately */
+}
+
 int upnp_next_timeout(void) {
     time_t now;
-    if (!active || ssdp_sock == -1) return -1;
+    if (!active) return -1;
+    /* If the socket is not up yet, wake up periodically to retry opening it. */
+    if (ssdp_sock == -1) return SSDP_RETRY;
     now = time(NULL);
     if (next_alive <= now) return 0;
     return (int)(next_alive - now);
@@ -615,9 +651,38 @@ int upnp_next_timeout(void) {
 
 void upnp_periodic(void) {
     time_t now;
-    if (!active || ssdp_sock == -1) return;
+    if (!active) return;
+
+    now = time(NULL);
+
+    /* If the SSDP socket never opened (port busy at startup, interface not
+     * ready), keep trying rather than staying invisible until a restart. */
+    if (ssdp_sock == -1) {
+        if (now - ssdp_born < SSDP_RETRY) return;
+        ssdp_reopen();
+        if (ssdp_sock == -1) return;
+        next_alive = 0;
+    }
+
+    /* Heal a changed IP or a dropped multicast membership so the device does
+     * not silently vanish from control points. */
+    refresh_addr();
+
+    now = time(NULL);
+
+    /* Rebuild the socket every so often.  Whatever accumulated state makes
+     * discovery stop (lost membership, stale interface binding), this is the
+     * part a restart clears -- so clear it in place instead. */
+    if (now - ssdp_born >= SSDP_REOPEN_AFTER) {
+        ssdp_reopen();
+        if (ssdp_sock != -1)
+            next_alive = 0;
+    }
+
     now = time(NULL);
     if (now < next_alive) return;
+
+    ssdp_join(ssdp_sock);
     ssdp_announce(0);
     if (alive_burst > 0) {
         alive_burst--;
@@ -627,9 +692,30 @@ void upnp_periodic(void) {
     }
 }
 
+/* Point multicast egress at the advertised interface and (re)join the SSDP
+ * group on it.  Called again before each announcement so a membership the
+ * kernel dropped (interface flap, IGMP snooping timeout) gets restored
+ * without restarting the server. */
+static void ssdp_join(int fd) {
+    struct ip_mreq mreq;
+    struct in_addr iface;
+
+    iface = server_addr;
+    if (iface.s_addr == htonl(INADDR_LOOPBACK))
+        iface.s_addr = htonl(INADDR_ANY);
+
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &iface, sizeof(iface));
+
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.imr_multiaddr.s_addr = inet_addr(SSDP_ADDR);
+    mreq.imr_interface.s_addr = iface.s_addr;
+    /* Not fatal if this fails: we can still answer unicast M-SEARCH and send
+     * NOTIFYs. */
+    setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+}
+
 static int ssdp_open(void) {
     struct sockaddr_in a;
-    struct ip_mreq mreq;
     int on = 1, ttl = 4, flags, s;
 
     s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -653,13 +739,7 @@ static int ssdp_open(void) {
         }
     }
 
-    memset(&mreq, 0, sizeof(mreq));
-    mreq.imr_multiaddr.s_addr = inet_addr(SSDP_ADDR);
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   &mreq, sizeof(mreq)) == -1) {
-        /* Not fatal: we can still answer unicast M-SEARCH and send NOTIFYs. */
-    }
+    ssdp_join(s);
 
     setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
@@ -667,7 +747,23 @@ static int ssdp_open(void) {
     if (flags != -1)
         fcntl(s, F_SETFL, flags | O_NONBLOCK);
 
+    ssdp_born = time(NULL);
     return s;
+}
+
+/* Replace the SSDP socket with a fresh one, re-binding the port and rejoining
+ * the group.  The new socket is opened before the old one is closed so there
+ * is no window without a listener.  On failure the old socket (if any) is
+ * kept. */
+static void ssdp_reopen(void) {
+    int ns = ssdp_open();
+
+    if (ns == -1) {
+        ssdp_born = time(NULL); /* remember the attempt; do not spin */
+        return;
+    }
+    if (ssdp_sock != -1) close(ssdp_sock);
+    ssdp_sock = ns;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1497,6 +1593,12 @@ int upnp_init(const char *friendly_name, const char *wwwroot,
 
     http_port = port;
     bootid = (unsigned int)time(NULL);
+
+    /* If the operator chose the address, advertise exactly that and never
+     * re-detect. */
+    ip_fixed =
+        (advertise_ip != NULL && strcmp(advertise_ip, "0.0.0.0") != 0) ||
+        (bind_addr != NULL && strcmp(bind_addr, "0.0.0.0") != 0);
 
     detect_addr(bind_addr, advertise_ip, &server_addr);
     if (inet_ntop(AF_INET, &server_addr, server_addr_str,
